@@ -1,10 +1,13 @@
 """FastAPI 接口层。
 
-两类调用：
+两类单刃调用：
 - POST /v1/diffraction/parameters  返回 v、余隙、第一菲涅尔区半径
 - POST /v1/diffraction/assessment  同样输入，追加附加损耗与通视判定
+多刃（整条地形剖面，新增一层，旧接口行为不变）：
+- POST /v1/multiedge/assessment    吃整条剖面，递归选主障碍并合成总损耗
+- POST /v1/multiedge/batch         多条剖面成组评估，逐条独立
 另加：
-- POST /v1/diffraction/batch       一批链路一次算完，各条独立
+- POST /v1/diffraction/batch       一批单刃链路一次算完，各条独立
 - GET  /v1/examples/ridge          预置的山脊略微遮挡算例（损耗 > 6 dB）
 - GET  /healthz                    存活探针
 """
@@ -16,6 +19,17 @@ from fastapi.responses import JSONResponse
 
 from .batch import BatchItem, evaluate_batch
 from .presets import RIDGE_PRESET
+from .profile_batch import ProfileBatchItem, evaluate_profile_batch
+from .profile_schemas import (
+    ObstacleContributionResponse,
+    ObstacleSegmentResponse,
+    ProfileAssessmentResponse,
+    ProfileBatchItemResponse,
+    ProfileBatchRequest,
+    ProfileBatchResponse,
+    ProfileLinkInput,
+)
+from .profile_service import ProfileAssessment, assess_profile
 from .schemas import (
     BatchItemResponse,
     BatchRequest,
@@ -138,3 +152,91 @@ def ridge_example() -> FullAssessmentResponse:
     p = RIDGE_PRESET
     a = assess_full(p.d1_m, p.d2_m, p.h_m, p.frequency_mhz)
     return _to_full_response(p.link_id, a)
+
+
+def _to_profile_response(
+    link_id: str | None, a: ProfileAssessment
+) -> ProfileAssessmentResponse:
+    return ProfileAssessmentResponse(
+        link_id=link_id,
+        total_loss_db=a.total_loss_db,
+        is_los=a.is_los,
+        obstacle_count=a.obstacle_count,
+        obstacles=[
+            ObstacleContributionResponse(
+                sample_index=o.sample_index,
+                distance_m=o.distance_m,
+                ground_elevation_m=o.ground_elevation_m,
+                side=o.side,
+                depth=o.depth,
+                segment=ObstacleSegmentResponse(
+                    left_distance_m=o.segment_left_distance_m,
+                    right_distance_m=o.segment_right_distance_m,
+                    d1_m=o.d1_m,
+                    d2_m=o.d2_m,
+                    h_m=o.h_m,
+                ),
+                v=o.v,
+                loss_db=o.loss_db,
+            )
+            for o in a.obstacles
+        ],
+        wavelength_m=a.wavelength_m,
+        path_length_m=a.path_length_m,
+    )
+
+
+@app.post(
+    "/v1/multiedge/assessment",
+    response_model=ProfileAssessmentResponse,
+    responses={400: {"model": ErrorResponse}},
+)
+def multiedge_assessment(link: ProfileLinkInput) -> ProfileAssessmentResponse:
+    """多刃评估：吃整条地形剖面，自行折算余隙、递归选主障碍并合成。"""
+    a = assess_profile(
+        frequency_mhz=link.frequency_mhz,
+        path_length_m=link.path_length_m,
+        tx_ground_elevation_m=link.tx.ground_elevation_m,
+        tx_antenna_height_m=link.tx.antenna_height_m,
+        rx_ground_elevation_m=link.rx.ground_elevation_m,
+        rx_antenna_height_m=link.rx.antenna_height_m,
+        profile_samples=[(p.distance_m, p.elevation_m) for p in link.profile],
+    )
+    return _to_profile_response(link.link_id, a)
+
+
+@app.post(
+    "/v1/multiedge/batch",
+    response_model=ProfileBatchResponse,
+    responses={400: {"model": ErrorResponse}},
+)
+def multiedge_batch(request: ProfileBatchRequest) -> ProfileBatchResponse:
+    """多刃批量：多条剖面成组评估，单条校验失败只影响它自己。"""
+    items = [
+        ProfileBatchItem(
+            link_id=link.link_id,
+            frequency_mhz=link.frequency_mhz,
+            path_length_m=link.path_length_m,
+            tx_ground_elevation_m=link.tx.ground_elevation_m,
+            tx_antenna_height_m=link.tx.antenna_height_m,
+            rx_ground_elevation_m=link.rx.ground_elevation_m,
+            rx_antenna_height_m=link.rx.antenna_height_m,
+            profile_samples=[(p.distance_m, p.elevation_m) for p in link.profile],
+        )
+        for link in request.links
+    ]
+    results = evaluate_profile_batch(items)
+    return ProfileBatchResponse(
+        count=len(results),
+        results=[
+            ProfileBatchItemResponse(
+                link_id=r.link_id,
+                ok=r.ok,
+                result=_to_profile_response(r.link_id, r.result) if r.ok else None,
+                error=None
+                if r.ok
+                else ErrorBody(code="INVALID_INPUT", reason=r.error_reason or ""),
+            )
+            for r in results
+        ],
+    )
